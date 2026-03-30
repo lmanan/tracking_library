@@ -83,3 +83,10 @@ Sample data is already available under `tracking_library/tracklet_stitching/data
 | `tracklet_keypoints.csv` | Spatial locations of keypoints for each tracklet at every time point. Columns: `tracklet_id`, `t`, and `(y, x)` coordinates for each keypoint (`kp0_y`, `kp0_x`, …). Used to compute pairwise keypoint distances between candidate tracklet pairs. |
 | `tracklet_id_embeddings.csv` | Re-identification embedding vector for each tracklet. Each tracklet is randomly sampled 25 times (irrespective of its temporal duration), so `k` runs from 0 to 24 for every tracklet. Columns: `tracklet_id`, `k` (sample index), and 32 embedding dimensions. The embedding captures appearance/identity; the L2 distance between two tracklets' embeddings (`id_distance`) is used as an edge cost in the ILP. |
 
+## Demo
+
+
+
+https://github.com/user-attachments/assets/1898006f-b94a-4472-8df2-ba017f76c464
+
+
