@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tracking_library"
+version = "0.1.0"
+description = "Library containing multiple tracking scripts and corresponding configs."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Manan Lalit", email = "manan.lalit@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = [
+    "tracking_utils @ git+https://github.com/lmanan/tracking_utils.git",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/lmanan/tracking_library"
+Issues = "https://github.com/lmanan/tracking_library/issues"
+
+
+
