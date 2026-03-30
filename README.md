@@ -24,8 +24,8 @@ conda install -c conda-forge -c funkelab -c gurobi ilpy
 conda install -c conda-forge scip
 ```
 
-### 4. Install motile_experiments in Editable Mode
-Finally, install the motile_experiments repository in editable mode (useful for development):
+### 4. Install tracking_library in Editable Mode
+Finally, install the tracking_library repository in editable mode (useful for development):
 
 ```bash
 pip install -e .
@@ -47,7 +47,7 @@ pip install -e .
 
 ```bash
 cd tracking_library/tracklet_stitching/
-python infer_node_edge_selection.py
+python manual/infer_node_edge_selection.py
 ```
 
 
