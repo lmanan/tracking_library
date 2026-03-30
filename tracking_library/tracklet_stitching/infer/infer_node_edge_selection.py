@@ -50,6 +50,10 @@ pinned_nodes_false = config.get("pinned_nodes_false", [])
 pinned_chains = config.get("pinned_chains", [])
 
 
+# =============================================================================
+# 1. Build candidate graph
+# =============================================================================
+
 candidate_graph = create_tracklet_candidate_graph(
     tracklet_csv_path=csv_path,
     tracklet_embeddings_path=embeddings_path,
@@ -92,6 +96,10 @@ for chain in pinned_chains:
     for u, v in zip(chain[:-1], chain[1:]):
         if candidate_graph.has_edge(u, v):
             candidate_graph.edges[u, v]["pin"] = True
+
+# =============================================================================
+# 2. Formulate and solve ILP
+# =============================================================================
 
 track_graph = TrackGraph(candidate_graph, frame_attribute="t_start")
 
@@ -138,6 +146,10 @@ solution_graph = get_solution_graph(solver, solution)
 logger.info(
     f"# solution nodes: {solution_graph.number_of_nodes()}, # solution edges: {solution_graph.number_of_edges()}"
 )
+
+# =============================================================================
+# 3. Analyse and save solution
+# =============================================================================
 
 if num_tracks is not None:
     log_average_occupancy(solution_graph, num_tracks)
