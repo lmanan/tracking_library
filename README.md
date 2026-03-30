@@ -43,10 +43,20 @@ pip install -e .
 ```
 
 
+## Repository structure
+
+```
+tracklet_stitching/
+├── configs/   — YAML config files (data paths, cost attributes, solver settings)
+├── data/      — sample input CSV files (keypoints and embeddings)
+├── infer/     — inference scripts; weights are read from the config YAML
+└── train/     — weight-learning scripts; learned weights can be pasted back into the config YAML and used by the infer scripts
+```
+
 ## Getting Started
 
 ```bash
-cd tracking_library/tracklet_stitching/manual
+cd tracking_library/tracklet_stitching/infer
 python infer_node_edge_selection.py
 ```
 
