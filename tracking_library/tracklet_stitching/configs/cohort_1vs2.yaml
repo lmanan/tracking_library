@@ -1,21 +1,51 @@
-csv_path: ../data/tracklet_keypoints.csv
-embeddings_path: ../data/tracklet_id_embeddings.csv
-num_neighbors: 10
-max_spatial_distance: null
-max_time_gap: 100
-max_time_gap_past: 25
+# ---------------------------------------------------------------------------
+# Data paths
+# ---------------------------------------------------------------------------
+csv_path: ../data/tracklet_keypoints.csv          # keypoint locations per tracklet per frame
+embeddings_path: ../data/tracklet_id_embeddings.csv  # re-id embedding vectors per tracklet per frame
+
+# ---------------------------------------------------------------------------
+# Candidate graph construction
+# ---------------------------------------------------------------------------
+num_neighbors: 10          # max number of spatial nearest-neighbour candidates per tracklet
+max_spatial_distance: null # hard distance cutoff (null = no limit); filters candidate edges
+max_time_gap: 100          # max number of frames allowed between end of one tracklet and start of next
+max_time_gap_past: 25      # when building edges going backwards in time, cap the gap at this value
+
+# ---------------------------------------------------------------------------
+# Edge cost attributes
+# (pairwise distances between candidate tracklet pairs used as ILP edge costs)
+# ---------------------------------------------------------------------------
 edge_attributes:
-- kp_0_distance
-- kp_1_distance
-- kp_2_distance
-- kp_3_distance
-- id_distance
-- t_gap
-num_tracks: 12
-set_exact_track_count: true
-set_exact_active_tracklets_per_frame: false
-embeddings_attribute_prefix: embedding
+- kp_0_distance   # Euclidean distance between keypoint 0 of the two tracklets at the link boundary
+- kp_1_distance   # same for keypoint 1
+- kp_2_distance   # same for keypoint 2
+- kp_3_distance   # same for keypoint 3
+- id_distance     # L2 distance between re-id embedding vectors
+- t_gap           # temporal gap (frames) between the two tracklets
+
+# ---------------------------------------------------------------------------
+# Node cost attributes
+# ---------------------------------------------------------------------------
 node_attributes:
-- tracklet_length
-t_min: null 
-t_max: null 
+- tracklet_length  # number of frames the tracklet spans; longer tracklets are preferred
+
+# ---------------------------------------------------------------------------
+# ILP solver settings
+# ---------------------------------------------------------------------------
+num_tracks: 12                          # total number of tracks expected in the solution
+set_exact_track_count: true             # if true, enforce num_tracks as a hard equality constraint
+set_exact_active_tracklets_per_frame: false  # if true, enforce exactly num_tracks active nodes per frame
+
+# ---------------------------------------------------------------------------
+# Embedding attribute prefix
+# (columns in the embeddings CSV are named <prefix>_1, <prefix>_2, …)
+# ---------------------------------------------------------------------------
+embeddings_attribute_prefix: embedding
+
+# ---------------------------------------------------------------------------
+# Optional time window (null = use all frames)
+# When set, only tracklets whose t_start falls in [t_min, t_max] are considered.
+# ---------------------------------------------------------------------------
+t_min: null
+t_max: null
