@@ -46,8 +46,8 @@ pip install -e .
 ## Getting Started
 
 ```bash
-cd tracking_library/tracklet_stitching/
-python manual/infer_node_edge_selection.py
+cd tracking_library/tracklet_stitching/manual
+python infer_node_edge_selection.py
 ```
 
 
