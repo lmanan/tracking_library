@@ -11,7 +11,8 @@ license = { file = "LICENSE" }
 authors = [{ name = "Manan Lalit", email = "manan.lalit@gmail.com" }]
 requires-python = ">=3.10"
 dependencies = [
-    "tracking_utils @ git+https://github.com/lmanan/tracking_utils.git",
+    "tracking_utils @ git+https://github.com/lmanan/tracking_utils.git", # ready-to-use cost classes, constraint classes
+    "x_utils @ git+https://github.com/lmanan/x_utils.git", # loading and printing config yamls
 ]
 
 [project.optional-dependencies]
