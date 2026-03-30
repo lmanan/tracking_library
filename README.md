@@ -9,11 +9,11 @@ cd tracking_library
 ```
 
 ### 2. Set Up the Conda Environment
-Create and activate a dedicated Conda environment named `motile`:
+Create and activate a dedicated Conda environment named `experiments` (or any other preferred name):
 
 ```bash
-conda create -n motile python==3.10
-conda activate motile
+conda create -n experiments python==3.10
+conda activate experiments
 ```
 
 ### 3. Install Dependencies
@@ -35,8 +35,8 @@ Full Setup Summary:
 ```bash
 git clone https://github.com/lmanan/tracking_library.git
 cd tracking_library
-conda create -n motile python=3.10
-conda activate motile
+conda create -n experiments python=3.10
+conda activate experiments
 conda install -c conda-forge -c funkelab -c gurobi ilpy
 conda install -c conda-forge scip
 pip install -e .
