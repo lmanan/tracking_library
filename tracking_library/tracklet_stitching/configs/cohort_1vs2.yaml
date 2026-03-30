@@ -1,5 +1,5 @@
-csv_path: ./data/tracklet_keypoints.csv
-embeddings_path: ./data/tracklet_id_embeddings.csv
+csv_path: ../data/tracklet_keypoints.csv
+embeddings_path: ../data/tracklet_id_embeddings.csv
 num_neighbors: 10
 max_spatial_distance: null
 max_time_gap: 100
