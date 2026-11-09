@@ -1,3 +1,7 @@
+import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")  # avoid libomp double-load segfault
+
 import argparse
 import logging
 import pickle
@@ -5,9 +9,17 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
+import yaml
+import ilpy
+import ilpy.solver_backends as _ilpy_backends
+
+# Academic Gurobi file licenses report LicenseID 0, which ilpy 0.6 misreads as
+# the size-limited bundled license and silently falls back to SCIP. Force Gurobi.
+_ilpy_backends._have_gurobi_license = lambda: True
 from x_utils.general_utils import load_config, print_config
 from tracking_utils.create_tracklet_candidate_graph import (
     create_tracklet_candidate_graph,
+    add_forced_edges_to_graph,
 )
 from motile import TrackGraph
 from motile.solver import Solver
@@ -59,6 +71,17 @@ _OPTIONAL_KEYS = {
     "pinned_chains",
     "weights_yaml",
     "num_keypoints",
+    # Weight learning (structured SVM). When solve_weights is true the script
+    # learns weights from the pinned constraints instead of running inference.
+    "solve_weights",
+    "ssvm_eps",
+    "ssvm_max_iterations",
+    "ssvm_mode",
+    "ssvm_regularizer_weight",
+    # Interactive-tracker-only keys: the tracker's uncertainty-window ranking reads
+    # these from the shared config; the solver ignores them.
+    "rank_window_size",
+    "rank_window_stride",
 }
 
 # Keys removed in recent script changes — call out by name to make migration easy.
@@ -90,6 +113,11 @@ def _validate_config(config: dict) -> None:
 
     if "neighbors_scale" not in keys and "num_neighbors" not in keys:
         problems.append("either `neighbors_scale` or `num_neighbors` must be set")
+    if "neighbors_scale" in keys and "num_neighbors" in keys:
+        problems.append(
+            "set only one of `neighbors_scale` or `num_neighbors`, not both "
+            "(`neighbors_scale` would silently override `num_neighbors`)"
+        )
 
     if config.get("use_spatial_distance") and "num_keypoints" not in keys:
         problems.append("`use_spatial_distance: true` requires `num_keypoints`")
@@ -112,6 +140,19 @@ def _validate_config(config: dict) -> None:
             "at least one of `use_spatial_distance` / `use_id_embedding_distance` must be true"
         )
 
+    if config.get("solve_weights"):
+        ssvm_required = {"ssvm_eps", "ssvm_max_iterations", "ssvm_mode"}
+        ssvm_missing = ssvm_required - keys
+        if ssvm_missing:
+            problems.append(
+                f"`solve_weights: true` requires SSVM keys: {sorted(ssvm_missing)}"
+            )
+        valid_modes = {"sparse", "full_lineage", "dense"}
+        if "ssvm_mode" in keys and config["ssvm_mode"] not in valid_modes:
+            problems.append(
+                f"`ssvm_mode` must be one of {sorted(valid_modes)}, got {config['ssvm_mode']!r}"
+            )
+
     if problems:
         raise ValueError("Config validation failed:\n  - " + "\n  - ".join(problems))
 
@@ -131,19 +172,30 @@ def _derive_edge_attributes(
     return attrs
 
 
+def _ordered_weight_keys(edge_attributes: list, node_attributes: list) -> list:
+    """Weight keys in the exact order `add_costs` registers them on the solver.
+
+    motile's `solver.weights.from_ndarray` is positional, so the array must follow
+    this order: node selections, then edge selections, then Appear (weight,
+    constant) and Disappear (constant) **last**. (Mirrors add_costs in
+    tracking_utils/add_costs.py.)
+    """
+    keys = []
+    for attr in node_attributes:
+        keys.append(f"Node Selection {attr}_weight")
+        keys.append(f"Node Selection {attr}_constant")
+    for attr in edge_attributes:
+        keys.append(f"Edge Selection {attr}_regular_weight")
+        keys.append(f"Edge Selection {attr}_regular_constant")
+    keys.append("Appear_weight")
+    keys.append("Appear_constant")
+    keys.append("Disappear_constant")
+    return keys
+
+
 def _expected_weight_keys(edge_attributes: list, node_attributes: list) -> set:
     """The full set of motile weight keys the solver will read."""
-    keys = set()
-    for attr in node_attributes:
-        keys.add(f"Node Selection {attr}_weight")
-        keys.add(f"Node Selection {attr}_constant")
-    for attr in edge_attributes:
-        keys.add(f"Edge Selection {attr}_regular_weight")
-        keys.add(f"Edge Selection {attr}_regular_constant")
-    keys.add("Appear_weight")
-    keys.add("Appear_constant")
-    keys.add("Disappear_constant")
-    return keys
+    return set(_ordered_weight_keys(edge_attributes, node_attributes))
 
 
 def _default_weights(edge_attributes: list, node_attributes: list) -> dict:
@@ -350,6 +402,264 @@ def _log_infeasibility_diagnostics(
     )
 
 
+def _update_config(config_path: Path, updates: dict) -> None:
+    """Read-modify-write the YAML config, changing only the given keys."""
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f) or {}
+    cfg.update(updates)
+    with open(config_path, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False)
+
+
+def _derive_false_edges(
+    candidate_graph,
+    pinned_chains: list,
+    pinned_nodes_true: list,
+    pinned_nodes_false: list,
+) -> list:
+    """Candidate edges that are negative examples for sparse SSVM learning.
+
+    A candidate edge is labelled False (GT=0) iff *both* its endpoints are
+    labelled nodes (kept, dropped, or part of a pinned chain) and the edge is
+    not itself a pinned (True) edge. Restricting to edges whose endpoints are
+    both labelled keeps the negatives inside the reviewed region — edges that
+    cross into the unannotated tail [t, T] are left unlabelled (sparse).
+    """
+    labeled = set(pinned_nodes_true) | set(pinned_nodes_false)
+    true_set = set()
+    for chain in pinned_chains:
+        for nid in chain:
+            labeled.add(nid)
+        for u, v in zip(chain[:-1], chain[1:]):
+            true_set.add((u, v))
+    return [
+        (u, v)
+        for (u, v) in candidate_graph.edges
+        if u in labeled and v in labeled and (u, v) not in true_set
+    ]
+
+
+def learn_weights(
+    config: dict,
+    config_path: Path,
+    candidate_graph,
+    edge_attributes: list,
+    node_attributes: list,
+    edge_statistics: dict,
+    node_statistics: dict,
+    num_tracks,
+    set_exact_track_count: bool,
+    set_exact_active_tracklets_per_frame: bool,
+    pinned_nodes_true: list,
+    pinned_nodes_false: list,
+    pinned_chains: list,
+) -> None:
+    """Learn motile weights from the pinned constraints via structured SVM.
+
+    Runs instead of inference when `solve_weights: true`. GT labels are sparse —
+    only annotated nodes/edges (and derived negative edges) are labelled, the
+    rest are masked out. Writes learned weights to `weights_yaml` and resets
+    `solve_weights` to false so subsequent runs do normal inference.
+    """
+    import time
+    from motile.variables import (
+        EdgeSelected,
+        NodeSelected,
+        NodeAppear,
+        NodeDisappear,
+        NodeSplit,
+    )
+    from tracking_utils.get_groundtruth_mask import get_groundtruth_mask
+    from structsvm.soft_margin_loss import SoftMarginLoss
+    from structsvm.bundle_method import BundleMethod
+    from structsvm.hamming_costs import HammingCosts
+
+    mode = config["ssvm_mode"]
+
+    # ---------------------------------------------------------------------
+    # GT labels from the pinned constraints
+    # ---------------------------------------------------------------------
+    false_edges = _derive_false_edges(
+        candidate_graph, pinned_chains, pinned_nodes_true, pinned_nodes_false
+    )
+
+    n_node_true = n_node_false = n_edge_true = n_edge_false = 0
+    # Dropped first, then kept/chains, so True wins on any accidental overlap.
+    for nid in pinned_nodes_false:
+        if nid in candidate_graph.nodes:
+            candidate_graph.nodes[nid]["GT"] = 0
+            n_node_false += 1
+    for nid in pinned_nodes_true:
+        if nid in candidate_graph.nodes:
+            candidate_graph.nodes[nid]["GT"] = 1
+            n_node_true += 1
+    for chain in pinned_chains:
+        for nid in chain:
+            if nid in candidate_graph.nodes:
+                candidate_graph.nodes[nid]["GT"] = 1
+        for u, v in zip(chain[:-1], chain[1:]):
+            if candidate_graph.has_edge(u, v):
+                candidate_graph.edges[u, v]["GT"] = 1
+                n_edge_true += 1
+    for u, v in false_edges:
+        candidate_graph.edges[u, v]["GT"] = 0
+        n_edge_false += 1
+
+    logger.info(
+        "GT labels (mode=%s) — nodes: %d positive / %d negative; edges: %d positive / %d negative",
+        mode, n_node_true, n_node_false, n_edge_true, n_edge_false,
+    )
+    if (n_node_true + n_node_false + n_edge_true + n_edge_false) == 0:
+        raise ValueError("No GT labels found — nothing to learn from.")
+
+    # Dense mode requires a GT on EVERY node and edge — fill the unlabelled ones
+    # with 0 (treats everything unreviewed as negative). Sparse / full_lineage
+    # leave them unlabelled (masked out).
+    if mode == "dense":
+        for nid in candidate_graph.nodes:
+            candidate_graph.nodes[nid].setdefault("GT", 0)
+        for u, v in candidate_graph.edges:
+            candidate_graph.edges[u, v].setdefault("GT", 0)
+
+    # ---------------------------------------------------------------------
+    # Build solver (no pinning — GT is the learning target, not a constraint)
+    # ---------------------------------------------------------------------
+    track_graph = TrackGraph(candidate_graph, frame_attribute="t_start")
+    solver = Solver(track_graph)
+    add_costs(
+        solver,
+        edge_attributes=edge_attributes,
+        edge_statistics=edge_statistics,
+        node_attributes=node_attributes,
+        node_statistics=node_statistics,
+    )
+    add_constraints(
+        solver,
+        num_tracks=num_tracks,
+        max_children=1,
+        set_exact_track_count=set_exact_track_count,
+        set_exact_active_tracklets_per_frame=set_exact_active_tracklets_per_frame,
+        pin_attribute=None,
+    )
+
+    groundtruth, mask = get_groundtruth_mask(solver, gt_attribute="GT", mode=mode)
+    mask_bool = mask.astype(bool)
+
+    total = int(solver.num_variables)
+    n_labeled = int(mask_bool.sum())
+    n_skipped = total - n_labeled
+    logger.info("Ground-truth matrix size (before masking): %d variables", groundtruth.shape[0])
+    logger.info("Ground-truth matrix size (after masking, labelled): %d variables", n_labeled)
+    logger.info(
+        "Skipped variables (no GT assigned, masked out): %d  "
+        "(0 means a fully annotated video)", n_skipped,
+    )
+    for vt in (EdgeSelected, NodeSelected, NodeAppear, NodeDisappear, NodeSplit):
+        idxs = list(solver.get_variables(vt).values())
+        if not idxs:
+            continue
+        idx_arr = np.fromiter((int(i) for i in idxs), dtype=int, count=len(idxs))
+        labeled_t = int(mask_bool[idx_arr].sum())
+        logger.info(
+            "  %-14s: %d total, %d labelled, %d skipped",
+            vt.__name__, len(idxs), labeled_t, len(idxs) - labeled_t,
+        )
+
+    # ---------------------------------------------------------------------
+    # SSVM: soft-margin loss + bundle-method optimisation (learn all weight dims)
+    # ---------------------------------------------------------------------
+    features = solver.features.to_ndarray()
+    features[~mask_bool] = 0.0
+    learn_features = features.T.copy()  # (d, N)
+
+    # Learn only a subset of weight dimensions; the rest stay zero. The layout
+    # (1 node attr + edge attrs + Appear_weight/Appear_constant/Disappear_constant)
+    # is: node weight+constant, each edge attr's regular_weight & regular_constant,
+    # then Appear_weight, Appear_constant, Disappear_constant. We learn the node
+    # weight+constant, every edge regular_weight, the t_gap regular_constant, and
+    # Appear_constant/Disappear_constant; the edge constants and Appear_weight are
+    # frozen at 0.
+    if config["use_id_embedding_distance"]:
+        learnable_cols = [0, 1, 2, 4, 6, 8, 10, 12, 13, 15, 16]
+        expected_dims = 17  # 1 node attr (2) + 6 edge attrs (12) + 3
+    else:
+        learnable_cols = [0, 1, 2, 4, 6, 8, 10, 11, 13, 14]
+        expected_dims = 15  # 1 node attr (2) + 5 edge attrs (10) + 3
+    d = learn_features.shape[0]
+    if d != expected_dims:
+        raise ValueError(
+            f"learnable_cols assume {expected_dims} weight dims "
+            f"(1 node attr + {'6' if config['use_id_embedding_distance'] else '5'} "
+            f"edge attrs + 3), but the solver has {d}. Update learnable_cols for "
+            f"this node/edge-attribute layout."
+        )
+    learn_mask = np.zeros(d, dtype=bool)
+    learn_mask[learnable_cols] = True
+    learn_features[~learn_mask] = 0.0
+    logger.info("Learnable weight dims: %s (of %d; remaining forced to 0)", learnable_cols, d)
+
+    # All Hamming weights are 1, so HammingCosts matches the old WeightedHammingCost.
+    costs = HammingCosts(groundtruth, mask=mask_bool)
+    soft_margin_loss = SoftMarginLoss(
+        constraints=solver.constraints,
+        features=learn_features,
+        ground_truth=groundtruth,
+        costs=costs,
+    )
+    # SoftMarginLoss creates its own ilpy solver with Preference.Any; force
+    # full Gurobi here so weight learning does not silently fall back to SCIP
+    # and is not capped at the bundled 2000-variable license limit.
+    soft_margin_loss._solver = ilpy.Solver(
+        soft_margin_loss._num_variables,
+        ilpy.VariableType.Binary,
+        preference=ilpy.Preference.Gurobi,
+    )
+    soft_margin_loss._solver.set_verbose(True)
+    soft_margin_loss._solver.set_optimality_gap(0.0025)
+    soft_margin_loss._solver.set_timeout(300.0)
+    soft_margin_loss._solver.set_constraints(solver.constraints)
+    # Regularizer weight (lambda) for the bundle method's quadratic regularizer.
+    # Config-specifiable via `ssvm_regularizer_weight`; defaults to 0.01.
+    regularizer_weight = float(config.get("ssvm_regularizer_weight", 0.01))
+    logger.info("Regularizer weight (lambda) = %.6f", regularizer_weight)
+    bundle = BundleMethod(
+        value_gradient_callback=soft_margin_loss.value_and_gradient,
+        dims=learn_features.shape[0],
+        regularizer_weight=regularizer_weight,
+        eps=float(config["ssvm_eps"]),
+    )
+    t0 = time.time()
+    w = bundle.optimize(max_iterations=int(config["ssvm_max_iterations"]))
+    logger.info("SSVM optimisation took %.2fs.", time.time() - t0)
+    logger.info("Learned w = %s", w)
+
+    # ---------------------------------------------------------------------
+    # Map learned weights → canonical weights_data and persist
+    # ---------------------------------------------------------------------
+    weights_data = _default_weights(edge_attributes, node_attributes)
+    keys = list(weights_data.keys())
+    if len(keys) != len(w):
+        raise ValueError(
+            f"Learned weight vector length {len(w)} != expected {len(keys)} weight keys"
+        )
+    # Use the learned weights directly: the SSVM makes the GT minimise
+    # <w, features>, the same convention motile minimises, so no sign flip.
+    for i, key in enumerate(keys):
+        weights_data[key] = float(w[i])
+    logger.info("Learned weights_data: %s", weights_data)
+
+    weights_yaml = config.get("weights_yaml") or str(
+        Path(config_path).parent / "learned_weights.yaml"
+    )
+    weights_yaml = str(Path(weights_yaml).expanduser())
+    with open(weights_yaml, "w") as f:
+        yaml.dump(weights_data, f, default_flow_style=False)
+    logger.info("Saved learned weights to %s", weights_yaml)
+
+    _update_config(config_path, {"weights_yaml": weights_yaml, "solve_weights": False})
+    logger.info("Config updated: weights_yaml set, solve_weights reset to False.")
+
+
 def main(config_path: Path) -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -374,6 +684,11 @@ def main(config_path: Path) -> None:
         )
     else:
         num_neighbors = config["num_neighbors"]
+    # Always keep a reasonable floor so the candidate graph isn't too sparse to
+    # contain valid links (e.g. a small neighbors_scale * max_time_gap).
+    if num_neighbors < 10:
+        logger.info("num_neighbors floored from %d to 10.", num_neighbors)
+        num_neighbors = 10
     max_spatial_distance = config["max_spatial_distance"]
     node_attributes = config["node_attributes"]
     num_tracks = config["num_tracks"]
@@ -420,6 +735,9 @@ def main(config_path: Path) -> None:
     pinned_nodes_false = config.get("pinned_nodes_false", [])
     pinned_chains = config.get("pinned_chains", [])
 
+    # When true, learn weights from the pins via SSVM instead of running inference.
+    solve_weights = config.get("solve_weights", False)
+
     # =========================================================================
     # 1. Build (or load) candidate graph
     # =========================================================================
@@ -451,6 +769,32 @@ def main(config_path: Path) -> None:
         cache_key=cache_key,
         builder_kwargs=builder_kwargs,
     )
+    logger.info(
+        "Candidate graph at start: %d nodes, %d edges",
+        candidate_graph.number_of_nodes(),
+        candidate_graph.number_of_edges(),
+    )
+
+    # Force any pinned edge that the standard graph missed (excluded by
+    # num_neighbors / max_spatial_distance) so a pin is never silently dropped.
+    pinned_edges = [(c[0], c[1]) for c in pinned_chains if len(c) >= 2]
+    if pinned_edges:
+        n_forced = add_forced_edges_to_graph(
+            candidate_graph,
+            csv_path,
+            pinned_edges,
+            tracklet_embeddings_path=embeddings_path,
+            embeddings_attribute_prefix=embeddings_attribute_prefix,
+            t_min=t_min,
+            t_max=t_max,
+        )
+        if n_forced:
+            logger.info(
+                "Force-added %d pinned edge(s) missing from the candidate graph "
+                "(now %d edges).",
+                n_forced,
+                candidate_graph.number_of_edges(),
+            )
 
     edge_statistics = compute_edge_statistics(
         candidate_graph, attributes=edge_attributes, frame_attribute="t_start"
@@ -468,6 +812,29 @@ def main(config_path: Path) -> None:
     _warn_skipped_pins(
         candidate_graph, pinned_nodes_true, pinned_nodes_false, pinned_chains
     )
+
+    # =========================================================================
+    # Weight-learning branch: learn weights from the pins (SSVM) and skip
+    # inference. solve_weights is reset to false inside learn_weights().
+    # =========================================================================
+    if solve_weights:
+        logger.info("solve_weights=true → learning weights (inference skipped).")
+        learn_weights(
+            config=config,
+            config_path=config_path,
+            candidate_graph=candidate_graph,
+            edge_attributes=edge_attributes,
+            node_attributes=node_attributes,
+            edge_statistics=edge_statistics,
+            node_statistics=node_statistics,
+            num_tracks=num_tracks,
+            set_exact_track_count=set_exact_track_count,
+            set_exact_active_tracklets_per_frame=set_exact_active_tracklets_per_frame,
+            pinned_nodes_true=pinned_nodes_true,
+            pinned_nodes_false=pinned_nodes_false,
+            pinned_chains=pinned_chains,
+        )
+        return
 
     for nid in pinned_nodes_true:
         if nid in candidate_graph.nodes:
@@ -509,12 +876,18 @@ def main(config_path: Path) -> None:
     )
 
     weights_data = _load_weights(weights_yaml, edge_attributes, node_attributes)
-    weights_array = np.array(list(weights_data.values()))
+    # Order by the solver's weight registration order (add_costs), NOT the YAML's
+    # dict order — from_ndarray is positional, so Appear/Disappear must come last.
+    ordered_keys = _ordered_weight_keys(edge_attributes, node_attributes)
+    weights_array = np.array([weights_data[k] for k in ordered_keys])
     logger.info(f"Using weights: {weights_array}")
     solver.weights.from_ndarray(weights_array)
     logger.info("Solving ILP optimization...")
     try:
-        solution = solver.solve(verbose=False)
+        solution = solver.solve(
+            verbose=False,
+            backend=ilpy.Preference.GurobiRestricted,
+        )
     except Exception as e:
         _log_infeasibility_diagnostics(
             e,
