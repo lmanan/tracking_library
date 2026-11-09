@@ -47,8 +47,6 @@ pip install -e .
 
 ```
 tracklet_stitching/
-├── configs/   — YAML config files (data paths, cost attributes, solver settings)
-├── data/      — sample input CSV files (keypoints and embeddings)
 ├── infer/     — inference scripts; weights are read from the config YAML
 └── train/     — weight-learning scripts; learned weights can be pasted back into the config YAML and used by the infer scripts
 ```
@@ -66,22 +64,13 @@ This script stitches short tracklets into full tracks using an Integer Linear Pr
 
 **High-level steps:**
 
-1. **Load config** — reads `configs/cohort_1vs2.yaml`, which specifies paths, cost attributes, and solver parameters.
+1. **Load config** — reads the YAML config, which specifies paths, cost attributes, and solver parameters.
 2. **Build candidate graph** — each tracklet becomes a node; candidate edges connect tracklets that are close in space and time (controlled by `num_neighbors`, `max_spatial_distance`, `max_time_gap`).
 3. **Compute statistics** — mean and std of each node/edge attribute are computed to normalise costs.
 4. **Pin nodes/edges** (optional) — specific tracklets can be forced into or out of the solution before solving.
 5. **Set up ILP** — costs and constraints (e.g. exact number of tracks, max one child per tracklet) are added to the `motile` solver.
 6. **Solve** — the ILP selects which nodes and edges to include so that the total cost is minimised.
 7. **Save solution** — the selected tracklets and links are written to `solution/solution_centroid.csv`.
-
-## Data files
-
-Sample data is already available under `tracking_library/tracklet_stitching/data/`.
-
-| File | Description |
-|------|-------------|
-| `tracklet_keypoints.csv` | Spatial locations of keypoints for each tracklet at every time point. Columns: `tracklet_id`, `t`, and `(y, x)` coordinates for each keypoint (`kp0_y`, `kp0_x`, …). Used to compute pairwise keypoint distances between candidate tracklet pairs. |
-| `tracklet_id_embeddings.csv` | Re-identification embedding vector for each tracklet. Each tracklet is randomly sampled 25 times (irrespective of its temporal duration), so `k` runs from 0 to 24 for every tracklet. Columns: `tracklet_id`, `k` (sample index), and 32 embedding dimensions. The embedding captures appearance/identity; the L2 distance between two tracklets' embeddings (`id_distance`) is used as an edge cost in the ILP. |
 
 ## Demo
 
